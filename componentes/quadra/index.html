@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: transparent; font-family: Inter, system-ui, "Segoe UI", sans-serif; }
+  #wrap { position: relative; width: 100%; height: 600px; border-radius: 14px; overflow: hidden;
+          box-shadow: 0 10px 30px rgba(0,0,0,.35); user-select: none; }
+  canvas { width: 100%; height: 100%; display: block; cursor: crosshair; outline: none; }
+  .barra { position: absolute; display: flex; gap: 6px; align-items: center; }
+  .pill { color: #cbd5e1; font-size: 12px; background: rgba(15,23,42,.72); padding: 6px 10px; border-radius: 999px;
+          cursor: pointer; border: 0; }
+  .pill input { vertical-align: -2px; }
+  .seta { font-size: 15px; font-weight: 800; padding: 6px 12px; }
+  .seta:active { background: #f97316; color: #111827; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" tabindex="0"></canvas>
+  <div class="barra" style="right:12px;top:12px">
+    <label class="pill"><input type="checkbox" id="traj" checked> trajetória h(t)</label>
+    <label class="pill"><input type="checkbox" id="dicas"> zonas exatas</label>
+    <label class="pill"><input type="checkbox" id="som" checked> 🔊 som</label>
+    <label class="pill"><input type="checkbox" id="lento"> câmera lenta</label>
+  </div>
+  <div class="barra" style="left:12px;bottom:12px">
+    <button class="pill seta" id="esq" title="Afastar da cesta (←)">◀</button>
+    <button class="pill seta" id="dir" title="Aproximar da cesta (→)">▶</button>
+    <span class="pill" style="cursor:default">🖱️ suba/desça o mouse (ou ↑ ↓ / rodinha) para mirar · segure o clique e solte para arremessar · ← → anda</span>
+  </div>
+</div>
+<script src="fisica.js"></script>
+<script>
+// ============ protocolo de componente do Streamlit (sem bibliotecas) ============
+const enviar = (type, data = {}) => window.parent.postMessage({ isStreamlitMessage: true, type, ...data }, "*");
+const devolver = value => enviar("streamlit:setComponentValue", { value, dataType: "json" });
+
+// ============ estado do jogo ============
+const V_MIN = 3, V_MAX = 15, D_MIN = 1, D_MAX = 10, A_MIN = 10, A_MAX = 85, PERIODO = 2.2;
+const S = {
+  v: 7.5, ang: 52, h0: 2, dist: 4.6,
+  modo: "mirar",          // mirar → forca → voo → fim
+  t0: 0, tForca: 0, sim: null, res: null, lento: false,
+  placar: { pts: 0, arr: 0, cestas: 0, seq: 0, melhor: 0 },
+  teclas: {}, passo: 0, ultimoEnvio: null, id: 0, agora: 0,
+  fx: { aro: null, aroForca: 0, tabela: null, tabelaForca: 0, rede: null }, confete: [],
+};
+const q = (v, p) => Math.round(v / p) * p;                     // arredonda no passo dos sliders
+const cl = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v)), lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t * t * (3 - 2 * t), PI = Math.PI;
+
+window.addEventListener("message", ev => {
+  if (!ev.data || ev.data.type !== "streamlit:render") return;
+  const a = ev.data.args || {}, chave = JSON.stringify([a.v, a.ang, a.dist, a.h0]);
+  S.h0 = a.h0 ?? S.h0;
+  if (S.ultimoEnvio === chave || S.modo === "voo") return;     // é o eco do nosso próprio arremesso
+  const mudou = S.ultimoArgs !== undefined && S.ultimoArgs !== chave;
+  S.ultimoArgs = chave;
+  Object.assign(S, { v: a.v ?? S.v, ang: a.ang ?? S.ang, dist: a.dist ?? S.dist });
+  if (mudou) arremessar(false);                                 // mexeu nos sliders → mostra o arremesso
+});
+
+// ============ câmera ============
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+let W = 0, H = 0, s = 1, ox = 0, oy = 0;
+const cam = { xmin: -3.1, xmax: 9, ymax: 4.8 };
+const X = x => ox + (x - cam.xmin) * s, Y = y => oy + (cam.ymax - y) * s, YMIN = -0.85;
+const mundo = (px, py) => [cam.xmin + (px - ox) / s, cam.ymax - (py - oy) / s];
+function camera(dt) {
+  const g = geometria(S.dist), r = resultado(S.v, S.ang, S.h0, S.dist), voando = S.modo === "voo" || S.modo === "fim";
+  const alvo = { xmin: -3.1, xmax: g.poste + 0.9, ymax: voando ? Math.min(9, Math.max(4.8, r.hmax + 0.8)) : 4.8 };
+  const k = 1 - Math.exp(-dt * 5);
+  for (const c in alvo) cam[c] = lerp(cam[c], alvo[c], k);
+  s = Math.min(W / (cam.xmax - cam.xmin), H / (cam.ymax - YMIN));
+  ox = (W - (cam.xmax - cam.xmin) * s) / 2; oy = H - (cam.ymax - YMIN) * s;
+}
+
+// ============ utilidades de desenho ============
+function cap(x1, y1, x2, y2, w, cor) {
+  ctx.strokeStyle = cor; ctx.lineWidth = w * s; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(X(x1), Y(y1)); ctx.lineTo(X(x2), Y(y2)); ctx.stroke();
+}
+function ik(ax, ay, bx, by, l1, l2, lado) {
+  let dx = bx - ax, dy = by - ay, d = Math.hypot(dx, dy);
+  d = cl(d, Math.abs(l1 - l2) + 1e-3, l1 + l2 - 1e-3);
+  const base = Math.atan2(dy, dx), a = Math.acos((l1 * l1 + d * d - l2 * l2) / (2 * l1 * d)), an = base + lado * a;
+  return [ax + l1 * Math.cos(an), ay + l1 * Math.sin(an)];
+}
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+function txt(t, x, y, cor, peso = 600, tam = 12, al = "left") {
+  ctx.fillStyle = cor; ctx.font = `${peso} ${tam}px Inter,system-ui`; ctx.textAlign = al; ctx.textBaseline = "alphabetic"; ctx.fillText(t, x, y);
+}
+let semente = 7; const rnd = () => (semente = (semente * 16807) % 2147483647) / 2147483647;
+const TORCIDA = Array.from({ length: 900 }, () => [rnd(), rnd(), rnd(), Math.floor(rnd() * 7)]);
+const TONS = ["#f97316", "#e2e8f0", "#3b82f6", "#facc15", "#94a3b8", "#ef4444", "#22c55e"];
+
+// ============ cenário ============
+function cenario() {
+  const g = geometria(S.dist), chao = Y(0);
+  let gr = ctx.createLinearGradient(0, 0, 0, chao);
+  gr.addColorStop(0, "#020617"); gr.addColorStop(.6, "#0f172a"); gr.addColorStop(1, "#1e293b");
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, W, chao);
+  for (const [fx, fy, fa, c] of TORCIDA) {                               // torcida
+    const yy = chao - 40 - fy * (chao * .62);
+    ctx.globalAlpha = .05 + fa * .1; ctx.fillStyle = TONS[c];
+    ctx.beginPath(); ctx.arc(fx * W, yy, 2.4 + fa * 1.6, 0, 2 * PI); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const [fx, a] of [[.2, .14], [.55, .1], [.85, .14]]) {           // holofotes
+    gr = ctx.createRadialGradient(W * fx, 0, 0, W * fx, 0, H * .9);
+    gr.addColorStop(0, `rgba(255,248,220,${a})`); gr.addColorStop(1, "rgba(255,248,220,0)");
+    ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+  }
+  ctx.fillStyle = "#0b1220"; ctx.fillRect(0, Y(.32), W, chao - Y(.32));    // placa de propaganda
+  ctx.font = `800 ${Math.max(10, .15 * s)}px Inter,system-ui`; ctx.textBaseline = "middle";
+  const ad = "CDI • AP2 • ARREMESSO CALCULADO      ", passo = ctx.measureText(ad).width;
+  ctx.fillStyle = "rgba(249,115,22,.5)"; for (let x = 12; x < W; x += passo) ctx.fillText(ad, x, Y(.16));
+  gr = ctx.createLinearGradient(0, chao, 0, H); gr.addColorStop(0, "#d4a06a"); gr.addColorStop(1, "#8b5a2b");
+  ctx.fillStyle = gr; ctx.fillRect(0, chao, W, H - chao);                // piso
+  ctx.strokeStyle = "rgba(90,50,20,.18)"; ctx.lineWidth = 1;
+  for (let i = 1; i < 10; i++) { const yy = chao + (H - chao) * Math.pow(i / 10, 1.6); ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(W, yy); ctx.stroke(); }
+  for (let x = Math.floor(cam.xmin); x < cam.xmax + 2; x += .7) { ctx.strokeStyle = "rgba(90,50,20,.08)"; ctx.beginPath(); ctx.moveTo(X(x), chao); ctx.lineTo(X(x) - 30, H); ctx.stroke(); }
+  // marcas da quadra (relativas ao aro): garrafão, lance livre (4,6 m) e linha de 3 (6,75 m)
+  const ll = S.dist - 4.6, l3 = S.dist - 6.75, lf = g.fundo;
+  ctx.fillStyle = "rgba(29,78,216,.55)";
+  ctx.beginPath(); ctx.moveTo(X(ll), chao); ctx.lineTo(X(lf), chao); ctx.lineTo(X(lf) + 40, H); ctx.lineTo(X(ll) - 30, H); ctx.fill();
+  const marca = (x, rot, cor) => {
+    ctx.strokeStyle = cor; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(X(x), chao); ctx.lineTo(X(x) - 30, H); ctx.stroke();
+    txt(rot, X(x) - 8, chao + 16, cor, 800, 10, "center");
+  };
+  marca(ll, "LANCE LIVRE", "rgba(255,255,255,.9)"); marca(l3, "3 PONTOS", "rgba(250,204,21,.95)");
+  ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(X(lf), chao); ctx.lineTo(X(lf) + 40, H); ctx.stroke();
+  ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, chao); ctx.lineTo(W, chao); ctx.stroke();
+  // estrutura da cesta
+  const p = g.poste;
+  ctx.fillStyle = "#1e3a8a"; rr(X(p - .45), Y(.65), .9 * s, .65 * s, 8); ctx.fill();
+  gr = ctx.createLinearGradient(X(p - .1), 0, X(p + .1), 0); gr.addColorStop(0, "#64748b"); gr.addColorStop(.5, "#cbd5e1"); gr.addColorStop(1, "#475569");
+  ctx.fillStyle = gr; ctx.fillRect(X(p - .1), Y(3.35), .2 * s, Y(.6) - Y(3.35));
+  ctx.fillStyle = "#1e3a8a"; rr(X(p - .14), Y(1.9), .28 * s, 1.3 * s, 6); ctx.fill();
+  ctx.strokeStyle = "#94a3b8"; ctx.lineCap = "round"; ctx.lineWidth = .1 * s;
+  ctx.beginPath(); ctx.moveTo(X(p), Y(3.3)); ctx.lineTo(X(g.tabela + .05), Y(3.3)); ctx.stroke();
+  ctx.lineWidth = .05 * s; ctx.beginPath(); ctx.moveTo(X(p), Y(2.85)); ctx.lineTo(X(g.tabela + .05), Y(3.3)); ctx.stroke();
+  const qt = (S.agora - (S.fx.tabela || -1e9)) / 1000, tremeT = qt < .6 ? 5 * S.fx.tabelaForca * Math.exp(-qt * 9) * Math.sin(qt * 80) : 0;
+  const tx = X(g.tabela) + tremeT, tw = Math.max(.07 * s, 4);
+  gr = ctx.createLinearGradient(tx, 0, tx + tw, 0); gr.addColorStop(0, "rgba(226,232,240,.95)"); gr.addColorStop(1, "rgba(148,163,184,.6)");
+  ctx.fillStyle = gr; ctx.fillRect(tx, Y(3.95), tw, Y(2.9) - Y(3.95));
+  ctx.fillStyle = "#f8fafc"; ctx.fillRect(tx - 1, Y(3.95), tw + 2, 3); ctx.fillRect(tx - 1, Y(2.9) - 3, tw + 2, 3);
+  ctx.fillStyle = "#ef4444"; ctx.fillRect(tx - 2, Y(3.5), 3, Y(3.05) - Y(3.5));
+  if (qt < .25) { ctx.fillStyle = `rgba(255,255,255,${.6 * (1 - qt / .25)})`; ctx.fillRect(tx - 3, Y(3.95), tw + 6, Y(2.9) - Y(3.95)); }
+}
+
+// ============ aro, rede e bola ============
+function aro(frente) {
+  const qa = (S.agora - (S.fx.aro || -1e9)) / 1000, treme = qa < 1 ? 7 * S.fx.aroForca * Math.exp(-qa * 7) * Math.sin(qa * 70) : 0;
+  const cx = X(S.dist), cy = Y(FIS.ARO) + treme, rx = FIS.RAIO * s, ry = .055 * s;
+  ctx.lineWidth = Math.max(.035 * s, 2.5); ctx.strokeStyle = frente ? "#f97316" : "#c2410c";
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, frente ? 0 : PI, frente ? PI : 2 * PI); ctx.stroke();
+  if (!frente) { ctx.strokeStyle = "#9ca3af"; ctx.lineWidth = .03 * s; ctx.beginPath(); ctx.moveTo(cx + rx, cy); ctx.lineTo(X(geometria(S.dist).tabela), cy - 2); ctx.stroke(); }
+}
+function rede(estica, bal) {
+  const n = 12, topo = FIS.ARO, base = FIS.ARO - .45 - .2 * estica, rb = .13 - .04 * estica;
+  const P = (i, nv) => { const a = i / n * 2 * PI; return [X(S.dist + lerp(FIS.RAIO, rb, nv) * Math.cos(a) + bal * nv * nv), Y(lerp(topo, base, nv)) + Math.sin(a) * .045 * s * (1 - nv * .4)]; };
+  ctx.lineWidth = 1.2; ctx.strokeStyle = "rgba(248,250,252,.85)";
+  const nv = [0, .33, .66, 1];
+  for (let k = 0; k < 3; k++) for (let i = 0; i < n; i++) {
+    const [a1, b1] = P(i, nv[k]), [a2, b2] = P(i + .5, nv[k + 1]), [a3, b3] = P(i - .5, nv[k + 1]);
+    ctx.beginPath(); ctx.moveTo(a1, b1); ctx.lineTo(a2, b2); ctx.moveTo(a1, b1); ctx.lineTo(a3, b3); ctx.stroke();
+  }
+}
+const RB = .15;
+function bola(x, y, rot) {
+  const cx = X(x), cy = Y(y), r = RB * s;
+  ctx.save(); ctx.translate(cx, cy);
+  const gr = ctx.createRadialGradient(-r * .35, -r * .4, r * .1, 0, 0, r);
+  gr.addColorStop(0, "#ffb36b"); gr.addColorStop(.55, "#e8681f"); gr.addColorStop(1, "#9a3a0e");
+  ctx.fillStyle = gr; ctx.beginPath(); ctx.arc(0, 0, r, 0, 2 * PI); ctx.fill(); ctx.clip();
+  let sd = 3; const rn = () => (sd = (sd * 16807) % 2147483647) / 2147483647;
+  ctx.fillStyle = "rgba(90,30,5,.18)";
+  for (let i = 0; i < 60; i++) { ctx.beginPath(); ctx.arc((rn() - .5) * 2 * r, (rn() - .5) * 2 * r, r * .035, 0, 2 * PI); ctx.fill(); }
+  ctx.rotate(rot); ctx.strokeStyle = "#1c0a02"; ctx.lineWidth = Math.max(r * .09, 1.3);
+  ctx.beginPath(); ctx.moveTo(-r, 0); ctx.lineTo(r, 0); ctx.moveTo(0, -r); ctx.lineTo(0, r); ctx.stroke();
+  ctx.beginPath(); ctx.arc(-r * 1.55, 0, r * 1.15, -.78, .78); ctx.stroke();
+  ctx.beginPath(); ctx.arc(r * 1.55, 0, r * 1.15, PI - .78, PI + .78); ctx.stroke();
+  ctx.restore();
+}
+function sombra(x, y) {
+  const alt = Math.max(0, y - RB), a = cl(.45 - alt * .08, .08, .45), w = (RB * 1.1 + alt * .05) * s;
+  ctx.fillStyle = `rgba(20,10,0,${a})`; ctx.beginPath(); ctx.ellipse(X(x), Y(0) + 4, w, w * .22, 0, 0, 2 * PI); ctx.fill();
+}
+
+// ============ jogador ============
+const PELE = "#8d5524", PELE2 = "#6b3e1a", CAMISA = "#1d4ed8", CAMISA2 = "#1e3a8a", PX = -.48, T_PREP = .55, AR = .5;
+function corpo(agacha, pulo) {
+  const flex = agacha * .22;
+  return { quadril: [PX - .02 - agacha * .03, .98 - flex + pulo], ombro: [PX + .02 + agacha * .06, 1.5 - flex * .9 + pulo] };
+}
+const alturaPulo = () => Math.max(.18, (S.h0 - .12) - 1.5 - .41 + .02);   // pula mais se a soltura é alta
+const parabolaPulo = tau => { const tj = tau + .25; return tj > 0 && tj < AR ? alturaPulo() * 4 * (tj / AR) * (1 - tj / AR) : 0; };
+function drible(t) {                     // bola quicando: rápida embaixo, lenta em cima
+  const ph = (t % .6) / .6;
+  return [PX + .34, RB + (.9 - RB) * Math.pow(Math.abs(Math.cos(PI * ph)), .9)];
+}
+// Pose do arremesso em fases: drible → pegada/agachamento → subida + pulo → soltura no alto → punho caído → pouso
+function pose(agora, tau) {
+  const P = { agacha: .3, pulo: 0, bola: null, mao: null, guia: null, punho: 0, segura: true }, t = agora / 1000;
+  if (tau === null && S.modo === "forca") {                       // carregando: quanto mais força, mais agacha
+    const [va, vb] = S.faixa, f = cl((S.v - va) / (vb - va)), k = ease(cl((agora - S.tForca) / 180));
+    P.agacha = lerp(.3, .35 + .45 * f, k);
+    const G = [PX + .24, corpo(P.agacha, 0).ombro[1] - .36], D = drible(t);
+    P.bola = [lerp(D[0], G[0], k), lerp(D[1], G[1], k) + .01 * Math.sin(t * 18)];
+  } else if (tau !== null && tau < 0) {                           // subida: bola vai ao ponto de arremesso
+    const u = (tau + T_PREP) / T_PREP, dip = .35 + .45 * (S.f0 ?? .5);
+    P.pulo = parabolaPulo(tau);
+    P.agacha = u < .35 ? lerp(dip, dip + .1, ease(u / .35)) : lerp(dip + .1, 0, ease(cl((u - .35) / .3)));
+    const c = corpo(P.agacha, P.pulo), G = [PX + .24, corpo(dip, 0).ombro[1] - .36];
+    const SP = [PX + .17, c.ombro[1] + .42], R = [0, S.h0];
+    P.bola = u < .6 ? [lerp(G[0], SP[0], ease(u / .6)), lerp(G[1], SP[1], ease(u / .6))]
+                    : [lerp(SP[0], R[0], ease((u - .6) / .4)), lerp(SP[1], R[1], ease((u - .6) / .4))];
+  } else if (tau !== null) {                                      // depois de soltar: braço esticado e punho caído
+    P.segura = false; P.pulo = parabolaPulo(tau);
+    const pouso = tau - (AR - .25);
+    P.agacha = pouso > 0 ? .12 + .3 * Math.exp(-pouso * 6) : 0;
+    const c = corpo(P.agacha, P.pulo), c0 = corpo(0, alturaPulo()), desce = ease(cl((tau - .75) / .5));
+    const offM = [-.05 - c0.ombro[0], S.h0 - .12 - c0.ombro[1]], offG = [-.2 - c0.ombro[0], S.h0 - .1 - c0.ombro[1]];
+    const repM = [PX + .14, c.ombro[1] - .55], repG = [PX + .02, c.ombro[1] - .58];
+    P.mao = [lerp(c.ombro[0] + offM[0], repM[0], desce), lerp(c.ombro[1] + offM[1], repM[1], desce)];
+    P.guia = [lerp(c.ombro[0] + offG[0] - .05 * ease(cl(tau / .2)), repG[0], desce), lerp(c.ombro[1] + offG[1] - .1 * ease(cl(tau / .2)), repG[1], desce)];
+    P.punho = 1 - desce;
+  } else {                                                        // mirando: quicando a bola
+    P.segura = false; P.agacha = .3 + .03 * Math.sin(t * 2 * PI / .6); P.bola = drible(t);
+    const c = corpo(P.agacha, 0);
+    P.mao = [P.bola[0] - .01, Math.max(P.bola[1] + RB * .85, .8)]; P.guia = [PX + .03, c.ombro[1] - .52];
+  }
+  if (P.segura && P.bola) { P.mao = [P.bola[0] - .05, P.bola[1] - .12]; P.guia = [P.bola[0] - .13, P.bola[1] + .02]; }
+  return P;
+}
+function jogador(P) {
+  const { quadril, ombro } = corpo(P.agacha, P.pulo), andar = Math.sin(S.passo) * (S.andando ? .12 : 0);
+  const pes = P.pulo > .02 ? [[PX - .07, P.pulo + .03], [PX + .1, P.pulo + .01]] : [[PX - .14 + andar, .06], [PX + .16 - andar, .06]];
+  ctx.fillStyle = `rgba(20,10,0,${cl(.35 - P.pulo * .3, .08, .35)})`; ctx.beginPath(); ctx.ellipse(X(PX + .02), Y(0) + 4, (.4 - P.pulo * .2) * s, .07 * s, 0, 0, 2 * PI); ctx.fill();
+  const perna = (pe, cor, cs) => {
+    const ax = pe[0], ay = pe[1] + .08, [jx, jy] = ik(quadril[0], quadril[1], ax, ay, .46, .46, 1);
+    cap(quadril[0], quadril[1], jx, jy, .16, cor); cap(jx, jy, ax, ay, .115, cor);
+    cap(quadril[0], quadril[1] + .04, lerp(quadril[0], jx, .6), lerp(quadril[1], jy, .6), .2, cs);
+    cap(ax, ay - .02, ax, ay + .08, .1, "#f1f5f9");
+    const ponta = P.pulo > .02 ? -.35 : 0;                        // no ar o pé aponta para baixo
+    ctx.save(); ctx.translate(X(ax + .06), Y(ay - .04)); ctx.rotate(-ponta);
+    ctx.fillStyle = "#f8fafc"; ctx.beginPath(); ctx.ellipse(0, 0, .13 * s, .055 * s, 0, 0, 2 * PI); ctx.fill();
+    ctx.fillStyle = "#ea580c"; ctx.fillRect(-.11 * s, -.02 * s, .23 * s, .025 * s); ctx.restore();
+  };
+  const braco = (m, cor, w, punho = 0) => {
+    const [ex, ey] = ik(ombro[0], ombro[1], m[0], m[1], .31, .29, -1);
+    cap(ombro[0], ombro[1], ex, ey, w * 1.15, cor); cap(ex, ey, m[0], m[1], w, cor);
+    if (punho > .05) {                                             // "pescoço de ganso": punho dobrado após soltar
+      const a = Math.atan2(m[1] - ey, m[0] - ex) - 1.7 * punho;
+      cap(m[0], m[1], m[0] + .1 * Math.cos(a), m[1] + .1 * Math.sin(a), w * .85, cor);
+    } else { ctx.fillStyle = cor; ctx.beginPath(); ctx.arc(X(m[0]), Y(m[1]), w * .62 * s, 0, 2 * PI); ctx.fill(); }
+  };
+  perna(pes[0], PELE2, CAMISA2); braco(P.guia, PELE2, .08);
+  cap(quadril[0], quadril[1] + .05, ombro[0], ombro[1] - .06, .33, CAMISA);
+  cap(quadril[0] + .02, quadril[1] + .08, ombro[0] + .02, ombro[1] - .1, .2, "#2563eb");
+  ctx.fillStyle = "#fff"; ctx.font = `900 ${.16 * s}px Inter,system-ui`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("10", X(lerp(quadril[0], ombro[0], .55) + .02), Y(lerp(quadril[1], ombro[1], .55)));
+  perna(pes[1], PELE, CAMISA);
+  ctx.fillStyle = "#f8fafc"; rr(X(quadril[0] - .15), Y(quadril[1] + .1), .3 * s, .035 * s, 3); ctx.fill();
+  const olha = P.segura || P.punho > .3 ? -.45 : -.2, hx = ombro[0] + .05, hy = ombro[1] + .2;   // olha para o aro
+  cap(ombro[0] + .02, ombro[1], hx - .01, hy - .08, .09, PELE);
+  ctx.save(); ctx.translate(X(hx), Y(hy)); ctx.rotate(olha);
+  ctx.fillStyle = PELE; ctx.beginPath(); ctx.ellipse(0, 0, .105 * s, .12 * s, 0, 0, 2 * PI); ctx.fill();
+  ctx.fillStyle = "#111827"; ctx.beginPath(); ctx.ellipse(-.015 * s, -.03 * s, .1 * s, .095 * s, 0, PI * .95, PI * 2.05); ctx.fill();
+  ctx.fillStyle = "#f8fafc"; ctx.fillRect(-.1 * s, -.075 * s, .2 * s, .03 * s);
+  ctx.fillStyle = PELE2; ctx.beginPath(); ctx.arc(-.03 * s, 0, .025 * s, 0, 2 * PI); ctx.fill();
+  ctx.fillStyle = "#111"; ctx.beginPath(); ctx.arc(.065 * s, -.02 * s, .012 * s, 0, 2 * PI); ctx.fill();
+  ctx.fillStyle = PELE; ctx.beginPath(); ctx.arc(.1 * s, .01 * s, .025 * s, 0, 2 * PI); ctx.fill();
+  ctx.restore();
+  return () => braco(P.mao, PELE, .085, P.punho);
+}
+function barraFlutuante(P) {             // barra de potência acima da cabeça enquanto carrega
+  if (S.modo !== "forca") return;
+  const { ombro } = corpo(P.agacha, 0), [va, vb] = S.faixa, f = cl((S.v - va) / (vb - va));
+  const x0 = X(PX - .42), y0 = Y(ombro[1] + .62), w = .84 * s, h = Math.max(.09 * s, 9);
+  ctx.fillStyle = "rgba(15,23,42,.85)"; rr(x0 - 4, y0 - 4, w + 8, h + 8, 7); ctx.fill();
+  const fi = idealFracao();
+  ctx.fillStyle = "rgba(255,255,255,.08)"; rr(x0, y0, w, h, 4); ctx.fill();
+  ctx.fillStyle = gradPot(x0, 0, x0 + w, 0, fi); rr(x0, y0, Math.max(w * f, 2), h, 4); ctx.fill();
+  ctx.fillStyle = corPot(f, fi); ctx.beginPath(); ctx.arc(x0 + w * f, y0 + h / 2, h * .75, 0, 2 * PI); ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+  txt(`POTÊNCIA ${Math.round(f * 100)}%`, x0 + w / 2, y0 - 9, "#fde047", 800, 11, "center");
+}
+
+// ============ barra de força ============
+const AMARELO = [250, 204, 21], VERDE = [34, 197, 94], VERMELHO = [239, 68, 68];
+function idealFracao() {                 // onde fica a força ideal dentro da barra (0 = fraco, 1 = forte)
+  const vi = vIdeal(S.ang, S.h0, S.dist), [va, vb] = S.modo === "forca" ? S.faixa : faixa();
+  return vi ? cl((vi - va) / (vb - va), .08, .92) : .5;
+}
+function corPot(f, fi) {
+  const [a, b, k] = f <= fi ? [AMARELO, VERDE, f / fi] : [VERDE, VERMELHO, (f - fi) / (1 - fi)];
+  return `rgb(${a.map((c, j) => Math.round(lerp(c, b[j], ease(cl(k))))).join(",")})`;
+}
+function gradPot(x0, y0, x1, y1, fi) {
+  const g = ctx.createLinearGradient(x0, y0, x1, y1);
+  g.addColorStop(0, "rgb(250,204,21)"); g.addColorStop(fi, "rgb(34,197,94)"); g.addColorStop(1, "rgb(239,68,68)");
+  return g;
+}
+function faixa() {                       // a barra cobre ±40% da força ideal para o ângulo/distância atuais
+  const vi = vIdeal(S.ang, S.h0, S.dist);
+  if (!vi || vi > V_MAX) return [V_MIN, V_MAX];
+  let a = Math.max(V_MIN, vi * .6), b = Math.min(V_MAX, vi * 1.4);
+  return [a, b];
+}
+function forcaAtual(agora) {             // vai e volta (para lá e para cá)
+  const f = .5 - .5 * Math.cos(2 * PI * (agora - S.tForca) / 1000 / PERIODO), [a, b] = S.faixa;
+  return q(a + f * (b - a), .05);
+}
+function zona(v) {
+  const r = resultado(v, S.ang, S.h0, S.dist);
+  return r.acertou ? "#22c55e" : (r.erro !== null && r.erro < .6) ? "#facc15" : "#ef4444";
+}
+function barraForca() {
+  const bx = 22, by = 150, bh = Math.min(H - 250, 300), bw = 26;
+  ctx.fillStyle = "rgba(15,23,42,.8)"; rr(bx - 10, by - 34, bw + 98, bh + 58, 12); ctx.fill();
+  txt("FORÇA", bx, by - 16, "#94a3b8", 800, 11);
+  const dicas = document.getElementById("dicas").checked, [va, vb] = S.modo === "forca" ? S.faixa : faixa();
+  if (dicas) for (let i = 0; i < bh; i += 2) {   // zonas exatas: cor = resultado real de cada velocidade
+    const v = va + (1 - i / bh) * (vb - va);
+    ctx.fillStyle = zona(v); ctx.globalAlpha = .85; ctx.fillRect(bx, by + i, bw, 2);
+  } else {                                          // amarelo (fraco) → verde (ideal) → vermelho (forte)
+    ctx.fillStyle = gradPot(0, by + bh, 0, by, idealFracao()); ctx.fillRect(bx, by, bw, bh);
+  }
+  ctx.globalAlpha = 1; ctx.strokeStyle = "rgba(255,255,255,.6)"; ctx.lineWidth = 1.5; rr(bx, by, bw, bh, 4); ctx.stroke();
+  const yv = v => by + (1 - cl((v - va) / (vb - va))) * bh;
+  for (let k = 0; k <= 4; k++) { const v = va + k * (vb - va) / 4; txt(v.toFixed(1).replace(".", ","), bx + bw + 6, yv(v) + 4, "#64748b", 600, 10); }
+  const vi = vIdeal(S.ang, S.h0, S.dist);
+  if (vi && vi >= V_MIN && vi <= V_MAX && dicas) {
+    ctx.strokeStyle = "#fff"; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(bx - 4, yv(vi)); ctx.lineTo(bx + bw + 4, yv(vi)); ctx.stroke(); ctx.setLineDash([]);
+  }
+  const yy = yv(S.v);                    // indicador
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.moveTo(bx + bw + 2, yy); ctx.lineTo(bx + bw + 12, yy - 7); ctx.lineTo(bx + bw + 12, yy + 7); ctx.fill();
+  ctx.fillRect(bx - 3, yy - 2, bw + 6, 4);
+  ctx.fillStyle = "rgba(15,23,42,.95)"; rr(bx + bw + 12, yy - 11, 68, 22, 6); ctx.fill();
+  txt(S.v.toFixed(2).replace(".", ","), bx + bw + 16, yy + 5, "#fff", 900, 14); txt("m/s", bx + bw + 58, yy + 4, "#94a3b8", 600, 9);
+  txt(dicas ? "verde = cesta" : "fraco → ideal → forte", bx - 2, by + bh + 16, dicas ? "#86efac" : "#cbd5e1", 600, 10);
+}
+
+// ============ painel de cálculo ao vivo ============
+function painel() {
+  const r = resultado(S.v, S.ang, S.h0, S.dist), vi = vIdeal(S.ang, S.h0, S.dist), x0 = 140, w = 300;
+  ctx.fillStyle = "rgba(15,23,42,.8)"; rr(x0, 12, w, 132, 12); ctx.fill();
+  txt("CÁLCULO AO VIVO", x0 + 12, 30, "#f97316", 800, 11);
+  const L = [
+    [`d = ${S.dist.toFixed(1)} m   θ = ${S.ang.toFixed(1)}°   v₀ = ${S.v.toFixed(2)} m/s`, "#f8fafc", 700],
+    [`h(t) = ${S.h0.toFixed(2)} + ${r.vy.toFixed(2)}t − 4,9t²     x(t) = ${r.vx.toFixed(2)}t`, "#cbd5e1", 600],
+    [`h'(t) = ${r.vy.toFixed(2)} − 9,8t = 0  →  t = ${r.tpico.toFixed(2)} s,  h máx = ${r.hmax.toFixed(2)} m`, "#cbd5e1", 600],
+    [`força ideal p/ esse ângulo: v = ${vi ? vi.toFixed(2) + " m/s" : "impossível (ângulo baixo)"}`, "#86efac", 600],
+    [`|x − d| no aro = ${r.erro === null ? "não alcança" : r.erro.toFixed(2) + " m"}   ${r.acertou ? "✔ entra" : "✖ não entra"}`, r.acertou ? "#86efac" : "#fca5a5", 700],
+  ];
+  L.forEach(([t, c, p], i) => txt(t.replaceAll(".", ","), x0 + 12, 52 + i * 19, c, p, 11.5));
+  // placar
+  const P = S.placar, px = W - 210;
+  ctx.fillStyle = "rgba(15,23,42,.8)"; rr(px, 52, 198, 66, 12); ctx.fill();
+  txt("PONTOS", px + 14, 70, "#94a3b8", 700, 10); txt(`${P.pts}`, px + 14, 100, "#f8fafc", 900, 26);
+  txt("ACERTOS", px + 78, 70, "#94a3b8", 700, 10); txt(`${P.cestas}/${P.arr}`, px + 78, 92, "#f8fafc", 800, 15);
+  txt(`${P.arr ? Math.round(100 * P.cestas / P.arr) : 0}%`, px + 78, 108, "#94a3b8", 600, 10);
+  txt("SEQUÊNCIA", px + 136, 70, "#94a3b8", 700, 10); txt(`🔥${P.seq}`, px + 136, 96, "#fdba74", 800, 15);
+  txt(S.dist >= 6.75 ? "vale 3 pontos" : "vale 2 pontos", px + 136, 110, S.dist >= 6.75 ? "#facc15" : "#94a3b8", 600, 9);
+}
+
+// ============ ações ============
+function arremessar(contar = true) {
+  if (S.modo === "voo") return;
+  S.v = q(cl(S.v, V_MIN, V_MAX), .05); S.ang = q(cl(S.ang, 5, A_MAX), .5); S.dist = q(cl(S.dist, D_MIN, D_MAX), .1);
+  S.f0 = S.faixa && S.modo === "forca" ? cl((S.v - S.faixa[0]) / (S.faixa[1] - S.faixa[0])) : .5;
+  S.sim = simular(S.v, S.ang, S.h0, S.dist, .01); S.res = resultado(S.v, S.ang, S.h0, S.dist);
+  S.evIdx = 0; S.somSoltou = false; S.somRes = false;
+  S.modo = "voo"; S.t0 = performance.now(); S.contar = contar; S.lento = document.getElementById("lento").checked;
+}
+function terminou() {
+  const P = S.placar;
+  if (S.contar) {
+    P.arr++;
+    if (S.res.acertou) { P.cestas++; P.pts += S.dist >= 6.75 ? 3 : 2; P.seq++; P.melhor = Math.max(P.melhor, P.seq); } else P.seq = 0;
+  }
+  S.id++;
+  const val = { id: `${Date.now()}-${S.id}`, v: +S.v.toFixed(2), ang: +S.ang.toFixed(1), dist: +S.dist.toFixed(1), acertou: S.res.acertou };
+  S.ultimoEnvio = JSON.stringify([val.v, val.ang, val.dist, S.h0]); S.ultimoArgs = S.ultimoEnvio;
+  devolver(val);                          // o Python atualiza sliders e todos os cálculos
+}
+function iniciarForca() { S.modo = "forca"; S.tForca = performance.now(); S.faixa = faixa(); }
+function mirar(ev) {                     // mouse em cima = ângulo alto; embaixo = ângulo baixo (≈ 8 px por grau)
+  if ((S.modo !== "mirar" && S.modo !== "fim") || ev.clientX < 0) return;
+  const r = cv.getBoundingClientRect(), f = cl((ev.clientY - r.top - 40) / (r.height - 120));
+  S.ang = q(A_MAX - f * (A_MAX - A_MIN), .5);
+}
+const ajustar = d => { if (S.modo === "mirar" || S.modo === "fim") S.ang = q(cl(S.ang + d, A_MIN, A_MAX), .5); };
+cv.addEventListener("wheel", e => { e.preventDefault(); ajustar(e.deltaY < 0 ? .5 : -.5); }, { passive: false });
+cv.addEventListener("pointermove", mirar);
+cv.addEventListener("pointerdown", ev => {           // segurar e soltar OU clicar duas vezes
+  cv.focus(); audio(); mirar(ev);
+  if (S.modo === "mirar" || S.modo === "fim") iniciarForca();
+  else if (S.modo === "forca") arremessar(true);
+});
+cv.addEventListener("pointerup", () => { if (S.modo === "forca" && performance.now() - S.tForca > 250) arremessar(true); });
+const andarTecla = { ArrowLeft: 1, a: 1, A: 1, ArrowRight: -1, d: -1, D: -1 };  // ← afasta, → aproxima
+window.addEventListener("keydown", e => { audio(); if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") { e.preventDefault(); ajustar(.5); } if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") { e.preventDefault(); ajustar(-.5); } if (e.key in andarTecla) { S.teclas[e.key] = true; e.preventDefault(); } if (e.key === "Escape" && S.modo === "forca") S.modo = "mirar"; if (e.key === " ") { e.preventDefault(); if (S.modo === "forca") arremessar(true); else if (S.modo !== "voo") iniciarForca(); } });
+window.addEventListener("keyup", e => { delete S.teclas[e.key]; });
+for (const [id, sent] of [["esq", 1], ["dir", -1]]) {
+  const b = document.getElementById(id), k = "btn" + id;
+  b.addEventListener("pointerdown", e => { e.preventDefault(); S.teclas[k] = sent; });
+  for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, () => delete S.teclas[k]);
+}
+
+// ============ sons (sintetizados com Web Audio, sem arquivos) ============
+const SOM = { ac: null };
+function audio() {
+  try { if (!SOM.ac) SOM.ac = new (window.AudioContext || window.webkitAudioContext)(); if (SOM.ac.state === "suspended") SOM.ac.resume(); } catch (e) { }
+  return SOM.ac;
+}
+function ruido(ac, dur) {
+  const b = ac.createBuffer(1, Math.ceil(ac.sampleRate * dur), ac.sampleRate), d = b.getChannelData(0);
+  for (let k = 0; k < d.length; k++) d[k] = Math.random() * 2 - 1;
+  const src = ac.createBufferSource(); src.buffer = b; return src;
+}
+function envelope(g, t, ataque, pico, queda) {
+  g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(pico, .0002), t + ataque);
+  g.gain.exponentialRampToValueAtTime(.0001, t + ataque + queda);
+}
+function tom(ac, saida, tipo, freq, t, ataque, pico, queda, freqFim) {
+  const o = ac.createOscillator(), g = ac.createGain(); o.type = tipo; o.frequency.setValueAtTime(freq, t);
+  if (freqFim) o.frequency.exponentialRampToValueAtTime(freqFim, t + ataque + queda);
+  envelope(g, t, ataque, pico, queda); o.connect(g).connect(saida); o.start(t); o.stop(t + ataque + queda + .05);
+}
+function chiado(ac, saida, t, dur, filtro, freq, pico, ataque = .005, q = 1, freqFim) {
+  const n = ruido(ac, dur + .05), f = ac.createBiquadFilter(), g = ac.createGain();
+  f.type = filtro; f.frequency.setValueAtTime(freq, t); f.Q.value = q;
+  if (freqFim) f.frequency.exponentialRampToValueAtTime(freqFim, t + dur);
+  envelope(g, t, ataque, pico, dur); n.connect(f).connect(g).connect(saida); n.start(t);
+}
+function tocar(tipo, forca = 1) {
+  if (!document.getElementById("som").checked) return;
+  const ac = SOM.ac; if (!ac || ac.state !== "running") return;
+  const t = ac.currentTime + .01, m = ac.createGain(); m.gain.value = .55; m.connect(ac.destination);
+  const F = .35 + .65 * forca;
+  if (tipo === "aro") {                    // "clang" metálico: parciais inarmônicas
+    for (const [fr, a, d] of [[530, 1, .55], [1190, .55, .4], [1785, .4, .32], [2460, .28, .25], [3170, .18, .2]]) tom(ac, m, "sine", fr * (1 + (Math.random() - .5) * .02), t, .002, .32 * a * F, d);
+    chiado(ac, m, t, .05, "highpass", 2500, .25 * F, .001);
+  } else if (tipo === "tabela") {         // pancada grave na tabela
+    tom(ac, m, "sine", 150, t, .003, .7 * F, .18, 55);
+    chiado(ac, m, t, .09, "lowpass", 900, .35 * F, .002);
+  } else if (tipo === "poste") {
+    for (const [fr, a] of [[210, 1], [395, .6], [690, .35]]) tom(ac, m, "sine", fr, t, .002, .25 * a * F, .6);
+  } else if (tipo === "chao") {           // quique na quadra
+    tom(ac, m, "sine", 110, t, .002, .55 * F, .11, 50);
+    chiado(ac, m, t, .03, "bandpass", 1800, .2 * F, .001, 2);
+  } else if (tipo === "rede") {           // "swish" da rede
+    chiado(ac, m, t, .38, "bandpass", 4200, .55, .015, .8, 1400);
+  } else if (tipo === "arremesso") {      // ar saindo da mão
+    chiado(ac, m, t, .22, "bandpass", 900, .08, .03, 1, 2000);
+  } else if (tipo === "torcida") {        // plim de acerto + torcida vibrando
+    [784, 988, 1319, 1568].forEach((fr, k) => tom(ac, m, "triangle", fr, t + k * .07, .01, .22, .5));
+    chiado(ac, m, t + .05, 1.8, "bandpass", 1100, .22, .35, .6);
+  } else if (tipo === "erro") {           // buzina curta + "ôôô" da torcida
+    tom(ac, m, "sawtooth", 110, t, .01, .12, .4); tom(ac, m, "sawtooth", 116.5, t, .01, .12, .4);
+    chiado(ac, m, t + .1, .9, "bandpass", 650, .12, .2, 3, 330);
+  }
+}
+
+// ============ efeitos ============
+function acontecer(ev, agora) {
+  tocar(ev.tipo, ev.forca);
+  if (ev.tipo === "aro") { S.fx.aro = agora; S.fx.aroForca = .4 + .6 * ev.forca; }
+  if (ev.tipo === "tabela") { S.fx.tabela = agora; S.fx.tabelaForca = .5 + .5 * ev.forca; }
+  if (ev.tipo === "rede") soltarConfete();
+}
+function soltarConfete() {
+  const cores = ["#f97316", "#facc15", "#22c55e", "#3b82f6", "#f8fafc", "#ef4444"];
+  for (let k = 0; k < 90; k++) S.confete.push({
+    x: X(S.dist), y: Y(FIS.ARO), vx: (Math.random() - .5) * 420, vy: -150 - Math.random() * 380,
+    r: Math.random() * PI, vr: (Math.random() - .5) * 14, c: cores[k % cores.length], vida: 1.6 + Math.random() * .8,
+  });
+}
+function confete(dt) {
+  S.confete = S.confete.filter(p => (p.vida -= dt) > 0);
+  for (const p of S.confete) {
+    p.vy += 600 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.r += p.vr * dt; p.vx *= .99;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.r); ctx.globalAlpha = cl(p.vida);
+    ctx.fillStyle = p.c; ctx.fillRect(-4, -2.5, 8, 5); ctx.restore();
+  }
+}
+
+// ============ laço principal ============
+const T_FIM = 1.4;
+let antes = performance.now();
+function quadro(agora) {
+  const dt = Math.min(.05, (agora - antes) / 1000); antes = agora;
+  // andar
+  let dir = 0; for (const k in S.teclas) dir += andarTecla[k] ?? S.teclas[k];
+  S.andando = dir !== 0 && S.modo !== "voo" && S.modo !== "forca";
+  if (S.andando) { S.dist = cl(S.dist + Math.sign(dir) * 2.2 * dt, D_MIN, D_MAX); S.passo += dt * 12; }
+  if (S.modo === "forca") S.v = forcaAtual(agora);
+  S.agora = agora;
+  camera(dt);
+  ctx.clearRect(0, 0, W, H); cenario();
+  let tau = null, bx, by, rot = 0, i = -1;
+  if (S.modo === "voo") {
+    const t = (agora - S.t0) / 1000 * (S.lento ? .3 : 1); tau = t - T_PREP;
+    const N = S.sim.pts.length;
+    if (tau >= 0) {
+      i = Math.min(N - 1, Math.floor(tau / S.sim.dt)); [bx, by] = S.sim.pts[i]; rot = -tau * 11;
+      if (!S.somSoltou) { S.somSoltou = true; tocar("arremesso"); }
+      const ev = S.sim.eventos;
+      while (S.evIdx < ev.length && ev[S.evIdx].i <= i) acontecer(ev[S.evIdx++], agora);
+    }
+    if (tau > N * S.sim.dt + T_FIM) { S.modo = "fim"; S.tFim = agora; terminou(); }
+  } else if (S.modo === "fim") {
+    if (agora - S.tFim < 2500) { const n = S.sim.pts.length - 1; [bx, by] = S.sim.pts[n]; i = n; tau = 3; } else S.modo = "mirar";
+  }
+  const P = pose(agora * (S.modo === "voo" && S.lento ? .3 : 1), tau);
+  if (P.bola && (tau === null || tau < 0)) { [bx, by] = P.bola; rot = tau === null && S.modo !== "forca" ? -by * 4 : 0; }
+  // mira e trajetória prevista
+  if (S.modo !== "voo") {
+    const th = S.ang * PI / 180, L = .45;
+    ctx.strokeStyle = "#fde047"; ctx.lineWidth = 2.5; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(X(0), Y(S.h0)); ctx.lineTo(X(L * Math.cos(th)), Y(S.h0 + L * Math.sin(th))); ctx.stroke();
+    ctx.fillStyle = "#fde047"; ctx.beginPath(); ctx.arc(X(L * Math.cos(th)), Y(S.h0 + L * Math.sin(th)), 3.5, 0, 2 * PI); ctx.fill();
+    ctx.strokeStyle = "rgba(253,224,71,.45)"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(X(0), Y(S.h0), .3 * s, -th, 0); ctx.stroke();
+    txt(`θ = ${S.ang.toFixed(1)}°`.replace(".", ","), X(.36), Y(S.h0 + .05), "#fde047", 800, 12);
+  }
+  if (document.getElementById("traj").checked) {
+    const r = resultado(S.v, S.ang, S.h0, S.dist), tf = (r.vy + Math.sqrt(r.vy ** 2 + 2 * FIS.G * S.h0)) / FIS.G;
+    ctx.setLineDash([4, 6]); ctx.strokeStyle = "rgba(147,197,253,.55)"; ctx.lineWidth = 2; ctx.beginPath();
+    for (let k = 0; k <= 80; k++) { const t = tf * k / 80, xx = r.vx * t, yy = S.h0 + r.vy * t - 4.9 * t * t; k ? ctx.lineTo(X(xx), Y(yy)) : ctx.moveTo(X(xx), Y(yy)); }
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#93c5fd"; ctx.beginPath(); ctx.arc(X(r.vx * r.tpico), Y(r.hmax), 4, 0, 2 * PI); ctx.fill();
+    txt(`h máx ${r.hmax.toFixed(2)} m`.replace(".", ","), X(r.vx * r.tpico), Y(r.hmax) - 10, "#93c5fd", 600, 11, "center");
+  }
+  if (i > 0) for (let j = Math.max(0, i - 24); j < i; j += 3) {                    // rastro
+    const a = (j - i + 24) / 24, [x, y] = S.sim.pts[j];
+    ctx.fillStyle = `rgba(249,115,22,${a * .28})`; ctx.beginPath(); ctx.arc(X(x), Y(y), RB * s * (.4 + a * .5), 0, 2 * PI); ctx.fill();
+  }
+  const bracoFrente = jogador(P);
+  sombra(bx, by); aro(false); bola(bx, by, rot); bracoFrente();
+  let est = 0, bal = 0;
+  if (S.sim && S.sim.entrou !== null && i >= S.sim.entrou) { const qq = (i - S.sim.entrou) * S.sim.dt; est = Math.exp(-qq * 3.5) * Math.abs(Math.cos(qq * 9)); bal = .04 * Math.exp(-qq * 3) * Math.sin(qq * 12); }
+  else if (S.fx.aro) { const qa = (agora - S.fx.aro) / 1000; if (qa < 1.2) bal = .05 * S.fx.aroForca * Math.exp(-qa * 4) * Math.sin(qa * 14); }
+  rede(est, bal); aro(true); confete(dt); barraFlutuante(P);
+  // resultado
+  if (S.modo === "voo" || S.modo === "fim") {
+    const t = (agora - S.t0) / 1000 * (S.lento ? .3 : 1);
+    const tRes = T_PREP + (S.sim.entrou !== null ? S.sim.entrou * S.sim.dt + .25 : S.sim.pts.length * S.sim.dt * .6);
+    if (t > tRes && !S.somRes && S.modo === "voo") { S.somRes = true; tocar(S.res.acertou ? "torcida" : "erro"); }
+    if (t > tRes || S.modo === "fim") {
+      const r = S.res, rot2 = r.acertou ? (r.erro < .08 ? "SWISH!" : "CESTA!") : (r.erro !== null && r.erro < .6 ? "QUASE!" : "ERROU!");
+      const cor = r.acertou ? "#22c55e" : r.erro !== null && r.erro < .6 ? "#f59e0b" : "#ef4444";
+      const k = S.modo === "fim" ? 1 : ease(cl((t - tRes) / .35));
+      ctx.save(); ctx.globalAlpha = k; ctx.translate(W / 2 + 60, H * .3); ctx.scale(.6 + .4 * k, .6 + .4 * k);
+      ctx.font = "900 54px Inter,system-ui"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.lineWidth = 8; ctx.strokeStyle = "rgba(2,6,23,.75)"; ctx.strokeText(rot2, 0, 0); ctx.fillStyle = cor; ctx.fillText(rot2, 0, 0);
+      if (r.acertou && S.contar) { ctx.font = "800 20px Inter,system-ui"; ctx.fillStyle = "#facc15"; ctx.fillText(`+${S.dist >= 6.75 ? 3 : 2} pontos`, 0, 40); }
+      ctx.font = "600 14px Inter,system-ui"; ctx.fillStyle = "#e2e8f0"; ctx.fillText(r.msg.replaceAll(".", ","), 0, r.acertou && S.contar ? 66 : 42);
+      ctx.restore();
+    }
+  }
+  barraForca(); painel();
+  if (S.modo === "forca") txt("solte o mouse (ou clique de novo) para arremessar!", W / 2 + 60, H - 50, "#fde047", 800, 16, "center");
+  requestAnimationFrame(quadro);
+}
+function redimensionar() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  W = r.width; H = r.height; cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", redimensionar);
+redimensionar(); requestAnimationFrame(quadro);
+enviar("streamlit:componentReady", { apiVersion: 1 });
+enviar("streamlit:setFrameHeight", { height: 606 });
+</script>
+</body>
+</html>
